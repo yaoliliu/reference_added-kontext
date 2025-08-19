@@ -71,6 +71,107 @@ def _get_qkv_projections(attn: "FluxAttention", hidden_states, encoder_hidden_st
         return _get_fused_projections(attn, hidden_states, encoder_hidden_states)
     return _get_projections(attn, hidden_states, encoder_hidden_states)
 
+class FluxCtlrRefAttnProcessor:
+    _attention_backend = None
+
+    def __init__(self):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError(f"{self.__class__.__name__} requires PyTorch 2.0. Please upgrade your pytorch version.")
+
+    def __call__(
+        self,
+        attn: "FluxAttention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+            attn, hidden_states, encoder_hidden_states
+        )
+        
+        encoder_len = encoder_query.shape[1] if encoder_query is not None else 0
+        
+        each_len = query.shape[1] // 3
+
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if attn.added_kv_proj_dim is not None:
+            encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+
+            encoder_query = attn.norm_added_q(encoder_query)
+            encoder_key = attn.norm_added_k(encoder_key)
+
+            query = torch.cat([encoder_query, query], dim=1)
+            key = torch.cat([encoder_key, key], dim=1)
+            value = torch.cat([encoder_value, value], dim=1)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+            
+        if encoder_hidden_states is not None:
+            encoder_q = query[:, :encoder_len, :, :]
+            encoder_k = key[:, :encoder_len, :, :]
+            encoder_v = value[:, :encoder_len, :, :]
+        
+            query = query[:, encoder_len:, :, :]
+            key = key[:, encoder_len:, :, :]
+            value = value[:, encoder_len:, :, :]
+        else:
+            # TODO: 这里encoder_len我们用了默认的512，后面要考虑通过传参动态获取
+            encoder_len = 512
+            
+            encoder_q = query[:, :encoder_len, :, :]
+            encoder_k = key[:, :encoder_len, :, :]
+            encoder_v = value[:, :encoder_len, :, :]
+        
+            query = query[:, encoder_len:, :, :]
+            key = key[:, encoder_len:, :, :]
+            value = value[:, encoder_len:, :, :]
+        
+        # 我们将 query, key, value 的noisy_latent, ctlr_latent和ref_latent分离，然后做成 cross-attn(encoder, [encoder, noisy, ctrl, ref]) cross-attn(noisy, [encoder, noisy, ctrl, ref]), cross-attn(ctrl, [encoder, noisy, ctrl]), cross-attn(ref, [encoder, ref]) ，这样我们的计算开销就是之前的1.5倍而不是2.25倍
+        noisy_q, ctlr_q, ref_q = query.chunk(3, dim=1)
+        noisy_k, ctlr_k, ref_k = key.chunk(3, dim=1)
+        noisy_v, ctlr_v, ref_v = value.chunk(3, dim=1)
+            
+        encoder_and_noisy_attn_out = dispatch_attention_fn(
+            torch.cat([encoder_q, noisy_q], dim=1), key, value, backend=self._attention_backend
+        )
+        ctlr_hidden_states = dispatch_attention_fn(
+            ctlr_q, torch.cat([encoder_k, noisy_k, ctlr_k], dim=1), torch.cat([encoder_v, noisy_v, ctlr_v], dim=1), backend=self._attention_backend
+        )
+        ref_hidden_states = dispatch_attention_fn(
+            ref_q, torch.cat([encoder_k, noisy_k, ref_k], dim=1), torch.cat([encoder_v, noisy_v, ref_v], dim=1), backend=self._attention_backend
+        )
+        
+        hidden_states = torch.cat([encoder_and_noisy_attn_out, ctlr_hidden_states, ref_hidden_states], dim=1)
+        # hidden_states = dispatch_attention_fn(
+        #     query, key, value, attn_mask=attention_mask, backend=self._attention_backend
+        # )
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+            )
+            hidden_states = attn.to_out[0](hidden_states)
+            hidden_states = attn.to_out[1](hidden_states)
+            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+            return hidden_states, encoder_hidden_states
+        else:
+            return hidden_states
+
 
 class FluxAttnProcessor:
     _attention_backend = None
@@ -268,6 +369,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
     _available_processors = [
         FluxAttnProcessor,
         FluxIPAdapterAttnProcessor,
+        FluxCtlrRefAttnProcessor,
     ]
 
     def __init__(
@@ -345,7 +447,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
 
 @maybe_allow_in_graph
 class FluxSingleTransformerBlock(nn.Module):
-    def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int, mlp_ratio: float = 4.0):
+    def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int, mlp_ratio: float = 4.0, is_ctrl_ref_version: bool = False):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
@@ -363,6 +465,8 @@ class FluxSingleTransformerBlock(nn.Module):
             )
             deprecate("npu_processor", "0.34.0", deprecation_message)
             processor = FluxAttnProcessor2_0_NPU()
+        elif is_ctrl_ref_version:
+            processor = FluxCtlrRefAttnProcessor()
         else:
             processor = FluxAttnProcessor()
 
@@ -412,7 +516,7 @@ class FluxSingleTransformerBlock(nn.Module):
 @maybe_allow_in_graph
 class FluxTransformerBlock(nn.Module):
     def __init__(
-        self, dim: int, num_attention_heads: int, attention_head_dim: int, qk_norm: str = "rms_norm", eps: float = 1e-6
+        self, dim: int, num_attention_heads: int, attention_head_dim: int, qk_norm: str = "rms_norm", eps: float = 1e-6, is_ctrl_ref_version: bool = False
     ):
         super().__init__()
 
@@ -427,7 +531,7 @@ class FluxTransformerBlock(nn.Module):
             out_dim=dim,
             context_pre_only=False,
             bias=True,
-            processor=FluxAttnProcessor(),
+            processor=FluxAttnProcessor() if not is_ctrl_ref_version else FluxCtlrRefAttnProcessor(),
             eps=eps,
         )
 
@@ -584,6 +688,8 @@ class FluxTransformer2DModel(
         pooled_projection_dim: int = 768,
         guidance_embeds: bool = False,
         axes_dims_rope: Tuple[int, int, int] = (16, 56, 56),
+        # FEAT: 我不想跟from_pretrained方法拉扯了，直接在这里调attn_processor类好了
+        is_ctrl_ref_version: bool = False,
     ):
         super().__init__()
         self.out_channels = out_channels or in_channels
@@ -607,6 +713,7 @@ class FluxTransformer2DModel(
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
+                    is_ctrl_ref_version=is_ctrl_ref_version,
                 )
                 for _ in range(num_layers)
             ]
@@ -618,6 +725,7 @@ class FluxTransformer2DModel(
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
+                    is_ctrl_ref_version=is_ctrl_ref_version,
                 )
                 for _ in range(num_single_layers)
             ]

@@ -141,6 +141,7 @@ else:
         "FluxPriorReduxPipeline",
         "ReduxImageEncoder",
         "FluxKontextPipeline",
+        "PEFluxKontextPipeline",
         "FluxKontextInpaintPipeline",
     ]
     _import_structure["audioldm"] = ["AudioLDMPipeline"]
@@ -620,6 +621,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             FluxInpaintPipeline,
             FluxKontextInpaintPipeline,
             FluxKontextPipeline,
+            PEFluxKontextPipeline,
             FluxPipeline,
             FluxPriorReduxPipeline,
             ReduxImageEncoder,
