@@ -748,7 +748,7 @@ class MaskPEFluxKontextPipeline(
                 batch_size, reference_latent_height // 2, reference_latent_width // 2, device, dtype
             )
             # image ids are the same as latent ids with the first dimension set to 1 instead of 0
-            ref_ids[..., 0] = 3
+            ref_ids[..., 0] = 4
             
             # Process reference mask if provided
             if reference_mask is not None:
@@ -774,7 +774,7 @@ class MaskPEFluxKontextPipeline(
                 for b in range(batch_size):
                     mask_indices = mask_flat[b] == 1
                     if mask_indices.any():
-                        ref_ids[mask_indices, 0] = 2
+                        ref_ids[mask_indices, 0] = 3
 
         latent_ids = self._prepare_latent_image_ids(batch_size, height // 2, width // 2, device, dtype)
 
